@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbbs.db
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Biomedical data files (not committed — too large; download from PhysioNet)
+*.dat
+*.hea
+*.atr
+*.edf
+*.npz
+*.csv
+
+# Temporary / scratch scripts
+smoke_*.py
+verify_*.py

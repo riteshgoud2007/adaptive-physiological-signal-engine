@@ -39,6 +39,7 @@ HARDENING CHANGES (v2.1.0):
 
 from __future__ import annotations
 
+import functools
 import math
 import time
 from typing import Any, Optional
@@ -47,6 +48,27 @@ import numpy as np
 from scipy import signal as sp_signal
 from scipy.ndimage import uniform_filter1d
 from scipy.stats import kurtosis as _scipy_kurtosis
+
+
+# ---------------------------------------------------------------------------
+# Module-level filter cache (avoids redesigning filters on every call)
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=32)
+def _cached_bp_sos(low: float, high: float, fs: float, order: int) -> Any:
+    """Cached Butterworth bandpass SOS coefficients."""
+    nyq = fs / 2.0
+    lo = float(np.clip(low / nyq, 1e-5, 0.999))
+    hi = float(np.clip(high / nyq, lo + 1e-5, 0.9995))
+    return sp_signal.butter(order, [lo, hi], btype="band", output="sos")
+
+
+@functools.lru_cache(maxsize=16)
+def _cached_notch_ba(freq: float, q: float, fs: float) -> tuple:
+    """Cached notch filter (b, a) coefficients."""
+    return sp_signal.iirnotch(freq, q, fs)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -264,17 +286,26 @@ def _process_ecg(
     result["signal_quality"] = quality
     result["signal_quality_score"] = quality_score
 
-    # 4. Powerline detection
-    pl50 = _detect_powerline(clean, 50.0, fs)
-    pl60 = _detect_powerline(clean, 60.0, fs)
+    # 4. Shared PSD — used for powerline detection, EMG characterization, and noise type
+    #    Computing once avoids 3 redundant scipy.signal.welch calls per ECG run.
+    _shared_psd: Optional[tuple] = None
+    if len(clean) >= int(fs * 2):
+        try:
+            _shared_psd = _compute_welch_psd(clean, fs, nperseg=2048)
+        except Exception:
+            _shared_psd = None
+
+    pl50 = _detect_powerline(clean, 50.0, fs, _psd_cache=_shared_psd)
+    pl60 = _detect_powerline(clean, 60.0, fs, _psd_cache=_shared_psd)
     result["powerline_50hz"] = pl50
     result["powerline_60hz"] = pl60
 
-    # 5. EMG characterization
-    emg_sev, emg_ratio = _characterize_emg(clean, fs)
+    # 5. EMG characterization (pass shared PSD to avoid another welch)
+    emg_sev, emg_ratio = _characterize_emg(clean, fs, _psd_cache=_shared_psd)
     result["emg_severity"] = emg_sev
     result["emg_energy_ratio"] = emg_ratio
-    result["noise_type"] = _dominant_noise_type(emg_sev, clean, fs)
+    result["noise_type"] = _dominant_noise_type(emg_sev, clean, fs, _psd_cache=_shared_psd)
+
 
     # 6. Preprocessing
     notched = clean.copy()
@@ -507,17 +538,18 @@ def _bandpass(
     high_hz: float,
     order: int,
 ) -> np.ndarray:
-    """Apply Butterworth SOS bandpass filter."""
+    """Apply Butterworth SOS bandpass filter (uses cached coefficients)."""
     nyq = fs / 2.0
     lo = max(1e-4, low_hz / nyq)
     hi = min(0.995, high_hz / nyq)
     if lo >= hi:
         return sig
     try:
-        sos = sp_signal.butter(order, [lo, hi], btype="band", output="sos")
+        sos = _cached_bp_sos(float(low_hz), float(high_hz), float(fs), int(order))
         return sp_signal.sosfiltfilt(sos, sig)
     except Exception:
         return sig
+
 
 
 def _notch_valid(freq: float, fs: float) -> bool:
@@ -958,7 +990,12 @@ def _measure_morphology(
     r_peaks: np.ndarray,
     fs: float,
 ) -> dict[str, Any]:
-    """Measure QRS and ST morphology before/after filtering."""
+    """Measure QRS and ST morphology before/after filtering.
+
+    Vectorized implementation: all beats processed in a single NumPy matrix
+    operation rather than a Python loop. Limits to 60 beats for efficiency
+    (sufficient for a reliable morphology score on any recording length).
+    """
     out: dict[str, Any] = {
         "qrs_amplitude_before": None,
         "qrs_amplitude_after": None,
@@ -977,56 +1014,81 @@ def _measure_morphology(
     if len(valid_peaks) < 3:
         return out
 
-    raw_amps, morph_amps = [], []
-    st_before_list, st_after_list = [], []
-    corrs: list[float] = []
+    # Limit to 60 beats — sufficient for morphology score, avoids O(N) cost
+    MAX_BEATS = 60
+    if len(valid_peaks) > MAX_BEATS:
+        # Sample evenly across the recording for representativeness
+        idx = np.round(np.linspace(0, len(valid_peaks) - 1, MAX_BEATS)).astype(int)
+        valid_peaks = valid_peaks[idx]
 
-    for pk in valid_peaks:
-        rw = raw[:n][pk - half_n: pk + half_n]
-        fw = morph[:n][pk - half_n: pk + half_n]
-        raw_amps.append(float(np.max(rw) - np.min(rw)))
-        morph_amps.append(float(np.max(fw) - np.min(fw)))
+    n_beats = len(valid_peaks)
+    win = 2 * half_n  # QRS window width in samples
 
-        # Waveform correlation
-        rc = rw - np.mean(rw)
-        fc = fw - np.mean(fw)
-        nr, nf = float(np.linalg.norm(rc)), float(np.linalg.norm(fc))
-        if nr > 1e-9 and nf > 1e-9:
-            corrs.append(float(np.clip(np.dot(rc, fc) / (nr * nf), -1.0, 1.0)))
+    # ---- Build beat matrices in one shot (n_beats × win) ----
+    # Row offsets: each row is [pk-half_n, pk-half_n+1, ..., pk+half_n-1]
+    offsets = np.arange(-half_n, half_n)             # shape (win,)
+    indices = valid_peaks[:, None] + offsets[None, :] # shape (n_beats, win)
+    # Clip to valid range
+    indices = np.clip(indices, 0, n - 1)
 
-        # ST level
-        iso_start = max(0, pk - half_n - st_win_n)
-        iso_end = max(1, pk - half_n)
-        iso = float(np.median(raw[:n][iso_start:iso_end]))
-        st_r = float(np.median(raw[:n][pk + st_off_n: pk + st_off_n + st_win_n])) - iso
-        st_f = float(np.median(morph[:n][pk + st_off_n: pk + st_off_n + st_win_n])) - iso
-        st_before_list.append(st_r)
-        st_after_list.append(st_f)
+    raw_mat  = raw[indices]    # (n_beats, win)
+    morph_mat = morph[indices] # (n_beats, win)
 
-    if raw_amps:
+    # ---- QRS amplitudes (vectorized) ----
+    raw_amps  = raw_mat.max(axis=1)  - raw_mat.min(axis=1)   # (n_beats,)
+    morph_amps = morph_mat.max(axis=1) - morph_mat.min(axis=1)
+
+    # ---- Waveform correlations (vectorized) ----
+    raw_c  = raw_mat  - raw_mat.mean(axis=1, keepdims=True)
+    morph_c = morph_mat - morph_mat.mean(axis=1, keepdims=True)
+    norms_r = np.linalg.norm(raw_c,  axis=1)
+    norms_m = np.linalg.norm(morph_c, axis=1)
+    valid_corr = (norms_r > 1e-9) & (norms_m > 1e-9)
+    corrs = np.where(
+        valid_corr,
+        np.sum(raw_c * morph_c, axis=1) / np.maximum(norms_r * norms_m, 1e-18),
+        0.0,
+    )
+    corrs = np.clip(corrs, -1.0, 1.0)
+
+    # ---- ST level (mean over small window — faster than median for tiny arrays) ----
+    iso_starts = np.maximum(0, valid_peaks - half_n - st_win_n)
+    iso_ends   = np.maximum(1, valid_peaks - half_n)
+    st_starts  = valid_peaks + st_off_n
+    st_ends    = valid_peaks + st_off_n + st_win_n
+
+    st_before_list: list[float] = []
+    st_after_list:  list[float] = []
+    for i in range(n_beats):
+        iso_seg   = raw[iso_starts[i]: iso_ends[i]]
+        iso_val   = float(np.mean(iso_seg)) if len(iso_seg) > 0 else 0.0
+        st_r_seg  = raw [st_starts[i]: min(st_ends[i], n)]
+        st_f_seg  = morph[st_starts[i]: min(st_ends[i], n)]
+        if len(st_r_seg) > 0:
+            st_before_list.append(float(np.mean(st_r_seg)) - iso_val)
+            st_after_list.append(float(np.mean(st_f_seg)) - iso_val)
+
+    # ---- Populate output ----
+    if len(raw_amps) > 0:
         out["qrs_amplitude_before"] = float(np.median(raw_amps))
-        out["qrs_amplitude_after"] = float(np.median(morph_amps))
+        out["qrs_amplitude_after"]  = float(np.median(morph_amps))
     if st_before_list:
         out["st_level_before"] = float(np.mean(st_before_list))
-        out["st_level_after"] = float(np.mean(st_after_list))
+        out["st_level_after"]  = float(np.mean(st_after_list))
 
     scores: list[float] = []
-    qrs_amp_before = out["qrs_amplitude_before"]
-    qrs_amp_after = out["qrs_amplitude_after"]
-    # fix #10: explicit None check
-    if (
-        qrs_amp_before is not None
-        and qrs_amp_after is not None
-        and qrs_amp_before > 1e-9
-    ):
-        ratio = qrs_amp_after / qrs_amp_before
-        scores.append(float(np.clip(min(ratio, 1.0), 0.0, 1.0)))
-    if corrs:
-        scores.append(float(np.clip(np.mean(corrs), 0.0, 1.0)))
+    qab = out["qrs_amplitude_before"]
+    qaa = out["qrs_amplitude_after"]
+    if qab is not None and qaa is not None and qab > 1e-9:
+        scores.append(float(np.clip(min(qaa / qab, 1.0), 0.0, 1.0)))
+    if valid_corr.any():
+        scores.append(float(np.clip(float(corrs[valid_corr].mean()), 0.0, 1.0)))
     if scores:
         out["morphology_score"] = float(np.mean(scores))
 
     return out
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1063,47 +1125,77 @@ def _assess_quality(
     return "CRITICAL", score
 
 
-def _detect_powerline(
-    sig: np.ndarray, freq: float, fs: float
+def _compute_welch_psd(
+    sig: np.ndarray, fs: float, nperseg: int = 2048
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Welch PSD once, return (freqs, psd). Used to share across multiple checks."""
+    n_seg = min(nperseg, len(sig))
+    return sp_signal.welch(sig, fs=fs, nperseg=n_seg)
+
+
+def _check_powerline_from_psd(
+    freqs: np.ndarray, psd: np.ndarray, freq: float, threshold_db: float
 ) -> bool:
-    """Return True if powerline interference at freq Hz is detected."""
-    # fix #7: validate before calling (also validated in caller, extra safety here)
+    """Check for powerline interference at freq Hz from a pre-computed PSD."""
+    idx = int(np.argmin(np.abs(freqs - freq)))
+    lo, hi = max(0, idx - 5), min(len(psd), idx + 6)
+    mask = np.ones(len(psd), bool)
+    mask[lo:hi] = False
+    floor = float(np.median(psd[mask])) + 1e-30
+    peak_db = 10 * math.log10(max(float(psd[idx]), 1e-30) / floor)
+    return peak_db > threshold_db
+
+
+def _detect_powerline(
+    sig: np.ndarray, freq: float, fs: float,
+    _psd_cache: Optional[tuple] = None,
+) -> bool:
+    """Return True if powerline interference at freq Hz is detected.
+
+    Pass _psd_cache=(freqs, psd) to reuse a pre-computed Welch PSD and avoid
+    a redundant FFT when checking both 50 and 60 Hz.
+    """
     if not _notch_valid(freq, fs):
         return False
     if len(sig) < int(fs * 2):
         return False
     try:
-        n_seg = min(2048, len(sig))
-        freqs, psd = sp_signal.welch(sig, fs=fs, nperseg=n_seg)
-        idx = int(np.argmin(np.abs(freqs - freq)))
-        lo, hi = max(0, idx - 5), min(len(psd), idx + 6)
-        mask = np.ones(len(psd), bool)
-        mask[lo:hi] = False
-        floor = float(np.median(psd[mask])) + 1e-30
-        peak_db = 10 * math.log10(max(float(psd[idx]), 1e-30) / floor)
-        return peak_db > _CFG["notch_power_db"]
+        if _psd_cache is not None:
+            freqs, psd = _psd_cache
+        else:
+            freqs, psd = _compute_welch_psd(sig, fs)
+        return _check_powerline_from_psd(freqs, psd, freq, _CFG["notch_power_db"])
     except Exception:
         return False
 
 
+
+
 def _characterize_emg(
-    sig: np.ndarray, fs: float
+    sig: np.ndarray, fs: float,
+    _psd_cache: Optional[tuple] = None,
 ) -> tuple[str, float]:
-    """Characterize EMG contamination severity."""
+    """Characterize EMG contamination severity.
+
+    Accepts an optional pre-computed (freqs, psd) tuple to avoid a redundant
+    scipy.signal.welch call when the PSD was already computed for powerline detection.
+    """
     finite = sig[np.isfinite(sig)]
     if len(finite) < 8:
         return "UNKNOWN", 0.0
     nyq = fs / 2.0
     if nyq > 100.0:
         try:
-            n_seg = min(512, len(finite))
-            freqs, psd = sp_signal.welch(finite, fs=fs, nperseg=n_seg)
+            if _psd_cache is not None:
+                freqs, psd = _psd_cache
+            else:
+                freqs, psd = _compute_welch_psd(finite, fs, nperseg=512)
             total = float(np.sum(psd)) + 1e-30
             hf = float(np.sum(psd[freqs > 100.0])) / total
         except Exception:
             hf = 0.0
     else:
-        # Fallback: kurtosis heuristic
+        # Fallback: kurtosis heuristic (no FFT needed)
         try:
             k = float(_scipy_kurtosis(np.diff(finite), fisher=True))
             hf = float(np.clip(k / 20.0, 0.0, 1.0))
@@ -1120,16 +1212,23 @@ def _characterize_emg(
 
 
 def _dominant_noise_type(
-    emg_severity: str, sig: np.ndarray, fs: float
+    emg_severity: str, sig: np.ndarray, fs: float,
+    _psd_cache: Optional[tuple] = None,
 ) -> str:
-    """Determine the dominant noise type label."""
+    """Determine the dominant noise type label.
+
+    Accepts an optional pre-computed (freqs, psd) tuple to avoid a redundant
+    scipy.signal.welch call.
+    """
     if "SEVERE" in emg_severity or "MODERATE" in emg_severity:
         return "EMG contamination"
     if "MILD" in emg_severity:
         return "Mild EMG / noise"
     try:
-        n_seg = min(256, len(sig))
-        freqs, psd = sp_signal.welch(sig, fs=fs, nperseg=n_seg)
+        if _psd_cache is not None:
+            freqs, psd = _psd_cache
+        else:
+            freqs, psd = _compute_welch_psd(sig, fs, nperseg=256)
         lf_frac = float(np.sum(psd[freqs < 1.0])) / (float(np.sum(psd)) + 1e-30)
         if lf_frac > 0.40:
             return "Baseline wander"
@@ -1138,6 +1237,8 @@ def _dominant_noise_type(
     except Exception:
         pass
     return "Clean"
+
+
 
 
 def _estimate_snr_proxy(sig: np.ndarray) -> Optional[float]:
