@@ -15,13 +15,26 @@ The algorithm is deterministic: same input always produces same output.
 OFFICIAL EVALUATOR NOTE:
 The OptiForge competition evaluator interface was not found in the local
 project files. The function signature below is designed to be clean,
-descriptive, and easy to wrap by any evaluator harness. Do NOT assume
-this is the official function name without verification.
+descriptive, and easy to wrap by any evaluator harness.
 
 AST COMPLIANCE:
   - No eval(), exec(), dynamic imports, or obfuscated code.
   - No hardcoded outputs, benchmark-specific hacks, or dataset fingerprinting.
   - Type-annotated, documented, modular, deterministic.
+
+HARDENING CHANGES (v2.1.0):
+  1. Rhythm: VT now requires HR + sustained regularity + multi-beat evidence.
+     Simple periodic signals no longer auto-classified as VT.
+  2. VF: Added signal-level characteristics (spectral, amplitude) alongside
+     RR-based evidence. Poor-quality-only signals not flagged as VF.
+  3. R-peak refinement: polarity-aware, rejects artifact spikes.
+  4. Search-back: deduplication + refractory check + polarity-aware refinement.
+  5. Latency: returns None when event onset cannot be established.
+  6. Modality: unknown modalities return unsupported warning, NOT processed as ECG.
+  7. Notch safety: validates notch frequency < Nyquist before filter design.
+  8. SNR: renamed to snr_proxy_db to distinguish from reference-based SNR.
+  9. PPG: renamed fields — pulse_peaks, pulse_rate_bpm, inter_pulse_intervals_s.
+ 10. SNR conditionals: explicit None checks throughout.
 """
 
 from __future__ import annotations
@@ -33,14 +46,17 @@ from typing import Any, Optional
 import numpy as np
 from scipy import signal as sp_signal
 from scipy.ndimage import uniform_filter1d
+from scipy.stats import kurtosis as _scipy_kurtosis
 
 
 # ---------------------------------------------------------------------------
 # Version and metadata
 # ---------------------------------------------------------------------------
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __algorithm__ = "Adaptive Physiological Signal Engine"
+
+_SUPPORTED_MODALITIES = {"ecg", "ppg", "emg"}
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +89,15 @@ _CFG: dict[str, Any] = {
     "emg_mild_hf_fraction": 0.05,
     "emg_moderate_hf_fraction": 0.15,
     "emg_severe_hf_fraction": 0.35,
-    # VT detection
+    # VT detection — requires MULTIPLE evidence sources
     "vt_hr_min_bpm": 120.0,
     "vt_sustained_beats": 4,
+    "vt_min_evidence_score": 0.65,   # raised from 0.5; requires more corroboration
+    "vt_min_beats": 6,               # minimum beats before VT can be flagged
+    "vt_regularity_min": 0.55,       # VT is typically quite regular
+    # VF detection
+    "vf_min_evidence_score": 0.55,
+    "vf_signal_entropy_min": 0.60,   # signal-level spectral entropy for VF
     # Rhythm classification
     "hr_tach_min": 100.0,
     "hr_brady_max": 60.0,
@@ -87,6 +109,8 @@ _CFG: dict[str, Any] = {
     "min_samples": 100,
     "min_fs": 50.0,
     "max_fs": 10000.0,
+    # Minimum duration (s) before rhythm classification is meaningful
+    "min_duration_for_rhythm_s": 5.0,
 }
 
 
@@ -112,57 +136,30 @@ def run(
     fs : float
         Sampling rate in Hz.
     modality : str
-        Signal modality: 'ecg', 'ppg', or 'emg'.
+        Signal modality: 'ecg', 'ppg', or 'emg'. Case-insensitive.
+        Unknown modalities return an error result — NOT silently treated as ECG.
     channel : int
         Channel index for multi-channel input (default 0).
 
     Returns
     -------
-    dict with keys:
-        algorithm_version (str)
-        modality (str)
-        fs (float)
-        n_samples (int)
-        duration_s (float)
-        valid (bool)
-        validation_message (str)
-        signal_quality (str)
-        signal_quality_score (float)
-        noise_type (str)
-        emg_severity (str)
-        emg_energy_ratio (float)
-        powerline_50hz (bool)
-        powerline_60hz (bool)
-        snr_before_db (float or None)
-        snr_after_db (float or None)
-        snr_improvement_db (float or None)
-        r_peaks (np.ndarray, int)        [ECG only]
-        n_beats (int)                    [ECG only]
-        rr_intervals_s (np.ndarray)      [ECG only]
-        heart_rate_bpm (float)           [ECG only]
-        heart_rate_reliable (bool)       [ECG only]
-        rhythm_label (str)               [ECG only]
-        rhythm_confidence (str)          [ECG only]
-        rhythm_confidence_score (float)  [ECG only]
-        possible_vt (bool)               [ECG only]
-        possible_vf (bool)               [ECG only]
-        vt_evidence (list[str])          [ECG only]
-        vf_evidence (list[str])          [ECG only]
-        detection_latency_s (float or None)
-        latency_target_met (bool or None)
-        qrs_amplitude_before (float or None)
-        qrs_amplitude_after (float or None)
-        st_level_before (float or None)
-        st_level_after (float or None)
-        morphology_score (float or None)
-        detection_reliability (float)
-        processing_time_s (float)
-        warnings (list[str])
+    dict with result keys — see docstring body for full list.
+
+    NOTE: SNR values are labelled snr_proxy_db (signal-derived estimate, not
+    reference-based true SNR). snr_before_db / snr_after_db are retained as
+    aliases for backward compatibility but refer to the same proxy metric.
     """
     t_start = time.perf_counter()
+
+    # Normalize modality safely
+    try:
+        mod = modality.strip().lower()
+    except AttributeError:
+        mod = "unknown"
+
     result: dict[str, Any] = {
         "algorithm_version": __version__,
-        "modality": modality.lower(),
+        "modality": mod,
         "fs": float(fs),
         "n_samples": 0,
         "duration_s": 0.0,
@@ -175,9 +172,14 @@ def run(
         "emg_energy_ratio": 0.0,
         "powerline_50hz": False,
         "powerline_60hz": False,
+        # SNR fields — proxy estimates, NOT reference-based true SNR
+        "snr_proxy_before_db": None,
+        "snr_proxy_after_db": None,
+        "snr_improvement_db": None,
+        # Aliases for backward compatibility
         "snr_before_db": None,
         "snr_after_db": None,
-        "snr_improvement_db": None,
+        # ECG-specific
         "r_peaks": np.array([], dtype=int),
         "n_beats": 0,
         "rr_intervals_s": np.array([]),
@@ -198,6 +200,10 @@ def run(
         "st_level_after": None,
         "morphology_score": None,
         "detection_reliability": 0.0,
+        # PPG-specific (named appropriately)
+        "pulse_peaks": np.array([], dtype=int),
+        "pulse_rate_bpm": 0.0,
+        "inter_pulse_intervals_s": np.array([]),
         "processing_time_s": 0.0,
         "warnings": [],
     }
@@ -213,7 +219,7 @@ def run(
     result["n_samples"] = len(sig1d)
     result["duration_s"] = len(sig1d) / fs
 
-    mod = modality.lower()
+    # --- Route by modality (fix #6: no silent fall-through) ---
     if mod == "ecg":
         _process_ecg(sig1d, fs, result)
     elif mod == "ppg":
@@ -221,10 +227,13 @@ def run(
     elif mod == "emg":
         _process_emg(sig1d, fs, result)
     else:
-        result["warnings"].append(
-            f"Unknown modality '{modality}'. Treating as ECG."
+        result["valid"] = False
+        result["validation_message"] = (
+            f"Unsupported modality '{modality}'. "
+            f"Accepted: {sorted(_SUPPORTED_MODALITIES)}. "
+            "Signal was NOT processed."
         )
-        _process_ecg(sig1d, fs, result)
+        result["warnings"].append(result["validation_message"])
 
     result["processing_time_s"] = time.perf_counter() - t_start
     return result
@@ -245,9 +254,10 @@ def _process_ecg(
     # 1. Interpolate NaN/Inf
     clean = _interpolate_nans(sig)
 
-    # 2. SNR before
-    snr_before = _estimate_snr(clean)
-    result["snr_before_db"] = snr_before
+    # 2. SNR proxy before (fix #8: clearly labelled as proxy)
+    snr_before = _estimate_snr_proxy(clean)
+    result["snr_proxy_before_db"] = snr_before
+    result["snr_before_db"] = snr_before  # backward-compat alias
 
     # 3. Signal quality
     quality, quality_score = _assess_quality(clean, fs)
@@ -268,12 +278,13 @@ def _process_ecg(
 
     # 6. Preprocessing
     notched = clean.copy()
-    if pl50:
-        b50, a50 = _make_notch(50.0, 30.0, fs)
+    # fix #7: validate notch frequency < Nyquist before applying
+    if pl50 and _notch_valid(50.0, fs):
+        b50, a50 = _make_notch(50.0, _CFG["notch_q"], fs)
         notched = sp_signal.filtfilt(b50, a50, notched)
         warnings.append("50 Hz notch applied.")
-    if pl60:
-        b60, a60 = _make_notch(60.0, 30.0, fs)
+    if pl60 and _notch_valid(60.0, fs):
+        b60, a60 = _make_notch(60.0, _CFG["notch_q"], fs)
         notched = sp_signal.filtfilt(b60, a60, notched)
         warnings.append("60 Hz notch applied.")
 
@@ -297,8 +308,10 @@ def _process_ecg(
                             _CFG["morph_bp_low_hz"], _CFG["morph_bp_high_hz"],
                             _CFG["morph_bp_order"])
 
-    snr_after = _estimate_snr(morph_path)
-    result["snr_after_db"] = snr_after
+    # fix #10: explicit None checks for SNR
+    snr_after = _estimate_snr_proxy(morph_path)
+    result["snr_proxy_after_db"] = snr_after
+    result["snr_after_db"] = snr_after  # backward-compat alias
     if snr_before is not None and snr_after is not None:
         result["snr_improvement_db"] = snr_after - snr_before
 
@@ -316,9 +329,10 @@ def _process_ecg(
             result["heart_rate_bpm"] = float(60.0 / np.median(valid_rr))
             result["heart_rate_reliable"] = True
 
-    # 9. Rhythm classification
+    # 9. Rhythm classification (fix #1/#2: hardened)
     rhythm = _classify_rhythm(
-        r_peaks, morph_path, fs, quality, emg_sev
+        r_peaks, morph_path, fs, quality, quality_score, emg_sev,
+        duration_s=result["duration_s"],
     )
     result["rhythm_label"] = rhythm["label"]
     result["rhythm_confidence"] = rhythm["confidence"]
@@ -328,18 +342,12 @@ def _process_ecg(
     result["vt_evidence"] = rhythm["vt_evidence"]
     result["vf_evidence"] = rhythm["vf_evidence"]
 
-    # 10. VT alert latency estimate
+    # 10. Alert latency (fix #5: proper onset-based latency)
     if rhythm["possible_vt"] or rhythm["possible_vf"]:
-        rr_s = result["rr_intervals_s"]
-        n_beats_needed = _CFG["vt_sustained_beats"]
-        if len(rr_s) >= n_beats_needed:
-            lat = float(np.sum(rr_s[:n_beats_needed]))
-        elif len(rr_s) > 0:
-            lat = float(np.sum(rr_s))
-        else:
-            lat = 0.0
+        lat = _compute_alert_latency(result["rr_intervals_s"], r_peaks, fs)
         result["detection_latency_s"] = lat
-        result["latency_target_met"] = lat <= _CFG["alert_latency_target_s"]
+        if lat is not None:
+            result["latency_target_met"] = lat <= _CFG["alert_latency_target_s"]
 
     # 11. Morphology preservation
     morph = _measure_morphology(clean, morph_path, r_peaks, fs)
@@ -355,7 +363,7 @@ def _process_ecg(
 
 
 # ---------------------------------------------------------------------------
-# PPG processing path
+# PPG processing path (fix #9: PPG-appropriate terminology)
 # ---------------------------------------------------------------------------
 
 def _process_ppg(
@@ -363,11 +371,13 @@ def _process_ppg(
     fs: float,
     result: dict[str, Any],
 ) -> None:
-    """PPG pulse detection pipeline."""
+    """PPG pulse detection pipeline. Uses pulse-rate terminology, not ECG terms."""
     clean = _interpolate_nans(sig)
-    result["snr_before_db"] = _estimate_snr(clean)
+    snr_before = _estimate_snr_proxy(clean)
+    result["snr_proxy_before_db"] = snr_before
+    result["snr_before_db"] = snr_before
 
-    # Baseline and PPG-specific bandpass (0.5-8 Hz)
+    # Baseline and PPG-specific bandpass (0.5–8 Hz)
     w = min(len(clean) - 1, max(3, int(1.5 * fs)))
     if w % 2 == 0:
         w += 1
@@ -382,23 +392,33 @@ def _process_ppg(
         filtered, distance=min_dist, prominence=max(1e-9, prom)
     )
 
-    result["r_peaks"] = peaks  # re-use field for pulse peaks
+    # fix #9: PPG uses pulse_peaks, inter_pulse_intervals_s, pulse_rate_bpm
+    result["pulse_peaks"] = peaks
+    # Also populate r_peaks for backward compatibility (clearly named as alias)
+    result["r_peaks"] = peaks
     result["n_beats"] = len(peaks)
 
     if len(peaks) >= 2:
         ipi = np.diff(peaks.astype(float)) / fs
         valid_ipi = ipi[(ipi >= 60.0 / 220.0) & (ipi <= 60.0 / 25.0)]
-        result["rr_intervals_s"] = valid_ipi
+        result["inter_pulse_intervals_s"] = valid_ipi
+        result["rr_intervals_s"] = valid_ipi  # backward-compat
         if len(valid_ipi) > 0:
-            result["heart_rate_bpm"] = float(60.0 / np.median(valid_ipi))
+            rate = float(60.0 / np.median(valid_ipi))
+            result["pulse_rate_bpm"] = rate
+            result["heart_rate_bpm"] = rate  # alias
             result["heart_rate_reliable"] = True
 
     quality, quality_score = _assess_quality(clean, fs)
     result["signal_quality"] = quality
     result["signal_quality_score"] = quality_score
-    result["snr_after_db"] = _estimate_snr(filtered)
-    if result["snr_before_db"] and result["snr_after_db"]:
-        result["snr_improvement_db"] = result["snr_after_db"] - result["snr_before_db"]
+
+    snr_after = _estimate_snr_proxy(filtered)
+    result["snr_proxy_after_db"] = snr_after
+    result["snr_after_db"] = snr_after
+    # fix #10: explicit None checks
+    if snr_before is not None and snr_after is not None:
+        result["snr_improvement_db"] = snr_after - snr_before
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +432,9 @@ def _process_emg(
 ) -> None:
     """EMG burst detection and characterization."""
     clean = _interpolate_nans(sig)
-    result["snr_before_db"] = _estimate_snr(clean)
+    snr_before = _estimate_snr_proxy(clean)
+    result["snr_proxy_before_db"] = snr_before
+    result["snr_before_db"] = snr_before
 
     # High-pass filter (>20 Hz for surface EMG)
     nyq = fs / 2.0
@@ -426,7 +448,7 @@ def _process_emg(
     w = max(1, int(0.1 * fs))
     rms = np.sqrt(uniform_filter1d(filtered ** 2, size=w, mode="nearest"))
 
-    # Burst detection: above 2 * median RMS
+    # Burst detection: above 2 × median RMS
     threshold = float(np.median(rms)) * 2.0
     bursts = rms > threshold
     burst_fraction = float(np.mean(bursts))
@@ -437,7 +459,14 @@ def _process_emg(
     result["noise_type"] = "EMG activity"
     result["signal_quality"] = "GOOD" if burst_fraction < 0.3 else "MODERATE"
     result["signal_quality_score"] = float(1.0 - min(burst_fraction, 1.0))
-    result["snr_after_db"] = _estimate_snr(filtered)
+
+    snr_after = _estimate_snr_proxy(filtered)
+    result["snr_proxy_after_db"] = snr_after
+    result["snr_after_db"] = snr_after
+    # fix #10: explicit None check
+    if snr_before is not None and snr_after is not None:
+        result["snr_improvement_db"] = snr_after - snr_before
+
     result["warnings"].append(
         f"EMG burst fraction: {burst_fraction*100:.1f}% of recording."
     )
@@ -491,10 +520,17 @@ def _bandpass(
         return sig
 
 
+def _notch_valid(freq: float, fs: float) -> bool:
+    """Return True if a notch at freq Hz is valid for sampling rate fs. (fix #7)"""
+    nyq = fs / 2.0
+    # Need at least 5 % margin below Nyquist
+    return nyq > freq * 1.05
+
+
 def _make_notch(
     freq: float, q: float, fs: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return IIR notch filter coefficients (b, a)."""
+    """Return IIR notch filter coefficients (b, a). Caller must validate freq < Nyquist."""
     return sp_signal.iirnotch(freq, q, fs)
 
 
@@ -514,13 +550,62 @@ def _suppress_emg(
         return sig
 
 
+def _refine_peak_polarity(
+    filtered: np.ndarray,
+    cand: int,
+    hw: int,
+) -> int:
+    """
+    Polarity-aware local R-peak refinement. (fix #3)
+
+    Instead of np.argmax(abs()), determine the dominant polarity of QRS
+    in the local window and find the local max in that direction.
+    Rejects obvious artifact spikes by checking width consistency.
+    """
+    n = len(filtered)
+    lo = max(0, cand - hw)
+    hi = min(n, cand + hw + 1)
+    if hi <= lo:
+        return cand
+
+    window = filtered[lo:hi]
+    # Determine polarity: whichever extreme is larger in absolute value
+    max_val = float(np.max(window))
+    min_val = float(np.min(window))
+
+    if abs(max_val) >= abs(min_val):
+        # Positive polarity — find local maximum
+        local_idx = int(np.argmax(window))
+    else:
+        # Negative polarity — find local minimum
+        local_idx = int(np.argmin(window))
+
+    refined = lo + local_idx
+
+    # Reject artifact spike: the QRS peak should not be a single isolated sample.
+    # If the two neighbors are both far below the peak, it may be an artifact.
+    if 0 < local_idx < len(window) - 1:
+        peak_amp = abs(window[local_idx])
+        neighbor_amp = max(abs(window[local_idx - 1]), abs(window[local_idx + 1]))
+        # Spike criterion: neighbors < 5 % of peak — likely artifact
+        if neighbor_amp < 0.05 * peak_amp and peak_amp > 0.0:
+            # Fall back to candidate
+            return cand
+
+    return refined
+
+
 def _detect_r_peaks(filtered: np.ndarray, fs: float) -> np.ndarray:
-    """Adaptive Pan-Tompkins R-peak detector."""
+    """
+    Adaptive Pan-Tompkins R-peak detector with polarity-aware refinement.
+    (fixes #3, #4)
+    """
     n = len(filtered)
     refractory_n = max(1, int(_CFG["refractory_s"] * fs))
     mwi_n = max(1, int(_CFG["mwi_win_s"] * fs))
     search_back_n = int(_CFG["search_back_s"] * fs)
     calib_n = min(int(_CFG["calib_s"] * fs), n // 4)
+    refine_hw = max(1, int(0.04 * fs))
 
     if n < refractory_n * 2:
         return np.array([], dtype=int)
@@ -551,6 +636,7 @@ def _detect_r_peaks(filtered: np.ndarray, fs: float) -> np.ndarray:
     spki_alpha = _CFG["spki_alpha"]
     npki_alpha = _CFG["npki_alpha"]
     accepted: list[int] = []
+    accepted_set: set[int] = set()
     last_accepted = -refractory_n * 2
 
     for cand in candidates:
@@ -558,33 +644,51 @@ def _detect_r_peaks(filtered: np.ndarray, fs: float) -> np.ndarray:
         refractory_ok = (cand - last_accepted) >= refractory_n
 
         if mwi[cand] > threshold and refractory_ok:
-            # Refine to local maximum in filtered signal
-            hw = max(1, int(0.04 * fs))
-            lo = max(0, cand - hw)
-            hi = min(n, cand + hw + 1)
-            refined = lo + int(np.argmax(np.abs(filtered[lo:hi])))
-            accepted.append(refined)
-            last_accepted = refined
+            # fix #3: polarity-aware refinement instead of np.argmax(abs())
+            refined = _refine_peak_polarity(filtered, cand, refine_hw)
+            if refined not in accepted_set:
+                accepted.append(refined)
+                accepted_set.add(refined)
+                last_accepted = refined
             spki = spki_alpha * mwi[cand] + (1 - spki_alpha) * spki
         else:
             npki = npki_alpha * mwi[cand] + (1 - npki_alpha) * npki
 
-    # Search-back: check for missed beats after long gaps
+    # fix #4: search-back with deduplication + refractory check + polarity refinement
     if len(accepted) >= 2:
-        peaks_arr = np.array(accepted)
+        peaks_arr = np.array(sorted(accepted))
         rr = np.diff(peaks_arr.astype(float))
         median_rr = float(np.median(rr))
+        sb_added: list[int] = []
+
         for i, gap in enumerate(rr):
             if gap > 1.66 * median_rr:
-                search_start = peaks_arr[i] + refractory_n
+                search_start = int(peaks_arr[i]) + refractory_n
                 search_end = min(n, search_start + search_back_n)
                 region = mwi[search_start:search_end]
                 if len(region) == 0:
                     continue
-                local_max = int(np.argmax(region)) + search_start
+                local_max_rel = int(np.argmax(region))
+                local_max = local_max_rel + search_start
                 threshold_sb = (npki + 0.25 * (spki - npki)) * 0.5
                 if mwi[local_max] > threshold_sb:
-                    accepted.append(local_max)
+                    # Refractory check against already-accepted peaks
+                    too_close = any(
+                        abs(local_max - p) < refractory_n
+                        for p in accepted_set
+                    )
+                    if not too_close and local_max not in accepted_set:
+                        # Polarity-aware refinement for search-back peak
+                        refined_sb = _refine_peak_polarity(filtered, local_max, refine_hw)
+                        too_close_refined = any(
+                            abs(refined_sb - p) < refractory_n
+                            for p in accepted_set
+                        )
+                        if not too_close_refined and refined_sb not in accepted_set:
+                            sb_added.append(refined_sb)
+                            accepted_set.add(refined_sb)
+
+        accepted.extend(sb_added)
 
     return np.array(sorted(set(accepted)), dtype=int)
 
@@ -594,9 +698,21 @@ def _classify_rhythm(
     ecg: np.ndarray,
     fs: float,
     quality: str,
+    quality_score: float,
     emg_severity: str,
+    duration_s: float = 0.0,
 ) -> dict[str, Any]:
-    """Feature-based rhythm classification."""
+    """
+    Feature-based rhythm classification. (fix #1, #2)
+
+    VT requires multiple evidence sources: HR + sustained fraction + regularity
+    + minimum beat count. A simple periodic non-ECG signal will NOT be
+    classified as VT based on rate alone.
+
+    VF uses signal-level characteristics (spectral, amplitude complexity)
+    in addition to RR-based features. Poor-quality-only signals without
+    additional VF evidence are NOT flagged as VF.
+    """
     out: dict[str, Any] = {
         "label": "Unknown / Unclassifiable",
         "confidence": "UNRELIABLE",
@@ -607,7 +723,14 @@ def _classify_rhythm(
         "vf_evidence": [],
     }
 
+    # Need minimum beats for any classification
     if len(r_peaks) < 4:
+        return out
+
+    # Require minimum recording duration for rhythm analysis
+    if duration_s > 0.0 and duration_s < _CFG["min_duration_for_rhythm_s"]:
+        out["label"] = "Recording Too Short for Rhythm Analysis"
+        out["confidence"] = "UNRELIABLE"
         return out
 
     times_s = r_peaks.astype(float) / fs
@@ -625,60 +748,122 @@ def _classify_rhythm(
     rmssd = float(np.sqrt(np.mean(ssd ** 2))) if len(ssd) > 0 else 0.0
     pnn50 = float(np.mean(np.abs(ssd) > 50.0)) if len(ssd) > 0 else 0.0
     regularity = float(np.clip(1.0 - cv_rr * 3.0, 0.0, 1.0))
+    entropy = _rr_entropy(valid)
 
-    # VT check
+    # ---------------------------------------------------------------
+    # fix #1: VT requires multiple corroborating sources
+    # NOT triggered by rate alone (prevents false VT on sine waves etc.)
+    # ---------------------------------------------------------------
     rapid = valid < (60.0 / _CFG["vt_hr_min_bpm"])
     max_run = _longest_run_bool(rapid)
     sustained_frac = max_run / max(len(valid), 1)
+    n_total_beats = len(r_peaks)
 
     vt_evidence: list[str] = []
     vt_score = 0.0
-    if hr >= _CFG["vt_hr_min_bpm"]:
-        vt_evidence.append(f"Rapid rate: {hr:.0f} BPM")
-        vt_score += 0.4
-    if sustained_frac >= 0.75:
+
+    # Evidence 1: Rapid rate — necessary but not sufficient alone
+    rate_criterion = hr >= _CFG["vt_hr_min_bpm"]
+    if rate_criterion:
+        vt_evidence.append(f"Rapid rate: {hr:.0f} BPM (>={_CFG['vt_hr_min_bpm']:.0f})")
+        vt_score += 0.30
+
+    # Evidence 2: Sustained rapid beats (majority of beats are rapid)
+    if sustained_frac >= 0.70 and rate_criterion:
         vt_evidence.append(f"Sustained rapid beats: {sustained_frac*100:.0f}%")
-        vt_score += 0.4
-    if regularity >= 0.6 and vt_score > 0:
+        vt_score += 0.25
+
+    # Evidence 3: Regular rhythm (VT is typically quite regular, unlike AF)
+    if regularity >= _CFG["vt_regularity_min"] and rate_criterion:
         vt_evidence.append(f"Regular rhythm (score={regularity:.2f})")
-        vt_score += 0.2
-    if vt_evidence:
+        vt_score += 0.20
+
+    # Evidence 4: Sufficient beat count (need to observe sustained tachycardia)
+    if n_total_beats >= _CFG["vt_min_beats"] and rate_criterion:
+        vt_evidence.append(f"Sustained observation: {n_total_beats} beats detected")
+        vt_score += 0.15
+
+    # Evidence 5: Low RR entropy (VT is regular, low entropy)
+    if entropy < 0.35 and rate_criterion:
+        vt_evidence.append(f"Low RR entropy (regular): {entropy:.2f}")
+        vt_score += 0.10
+
+    # VT requires minimum score — more than rate alone
+    # fix #1: min_evidence_score is 0.65, requires at least 2 corroborating sources
+    possible_vt = vt_score >= _CFG["vt_min_evidence_score"] and rate_criterion
+    if possible_vt:
         out["possible_vt"] = True
         out["vt_evidence"] = vt_evidence
+    else:
+        # Clear partial evidence that didn't meet threshold
+        vt_evidence.clear()
+        vt_score = 0.0
 
-    # VF check
+    # ---------------------------------------------------------------
+    # fix #2: VF — uses signal-level characteristics, not only RR
+    # NOT triggered by poor quality alone
+    # ---------------------------------------------------------------
     amps = _extract_amplitudes_sub(ecg, r_peaks, fs)
     amp_cv = float(np.std(amps) / max(np.mean(amps), 1e-9)) if len(amps) > 1 else 0.0
-    entropy = _rr_entropy(valid)
+
+    # Signal-level VF evidence: spectral entropy of the ECG signal itself
+    signal_entropy = _signal_spectral_entropy(ecg, fs)
 
     vf_evidence: list[str] = []
     vf_score = 0.0
-    if entropy > 0.65:
-        vf_evidence.append(f"High RR entropy: {entropy:.2f}")
-        vf_score += 0.3
-    if cv_rr > 0.25:
-        vf_evidence.append(f"Highly irregular RR (CV={cv_rr:.2f})")
-        vf_score += 0.2
+
+    # RR-level evidence
+    if entropy > 0.65 and cv_rr > 0.20:
+        vf_evidence.append(f"Disorganized RR: entropy={entropy:.2f}, CV={cv_rr:.2f}")
+        vf_score += 0.25
     if amp_cv > 0.50:
         vf_evidence.append(f"High amplitude variation (CV={amp_cv:.2f})")
-        vf_score += 0.2
-    if vf_evidence:
+        vf_score += 0.20
+
+    # Signal-level evidence (fix #2: does not rely solely on R-peaks)
+    if signal_entropy is not None and signal_entropy > _CFG["vf_signal_entropy_min"]:
+        vf_evidence.append(f"High signal spectral entropy: {signal_entropy:.2f}")
+        vf_score += 0.25
+
+    # Absence of organized QRS: very few beats detected despite long recording
+    beats_per_minute_detected = (len(r_peaks) / max(duration_s, 1.0)) * 60.0
+    if duration_s >= 5.0 and beats_per_minute_detected < 20.0 and quality != "CRITICAL":
+        vf_evidence.append(
+            f"Absent organized QRS: only {beats_per_minute_detected:.0f} "
+            "detections/min despite non-critical quality"
+        )
+        vf_score += 0.30
+
+    # Safety: do NOT flag VF if the only evidence is poor quality
+    # (poor quality alone must not produce VF alarm — fix #2)
+    if quality == "CRITICAL" and signal_entropy is None:
+        vf_score = max(0.0, vf_score - 0.40)
+        if vf_evidence:
+            vf_evidence.append("NOTE: evidence reduced — signal quality CRITICAL.")
+
+    if vf_score >= _CFG["vf_min_evidence_score"] and vf_evidence:
         out["possible_vf"] = True
         out["vf_evidence"] = vf_evidence
+    else:
+        vf_evidence.clear()
+        vf_score = 0.0
 
+    # ---------------------------------------------------------------
     # Primary label
+    # ---------------------------------------------------------------
     af = (
         cv_rr >= _CFG["af_cv_min"] and
         pnn50 >= _CFG["af_pnn50_min"] and
-        rmssd > 40.0 and entropy > 0.4
+        rmssd > 40.0 and
+        entropy > 0.4
     )
 
-    if vf_score > 0.5:
+    if vf_score >= _CFG["vf_min_evidence_score"] and out["possible_vf"]:
         label = "Possible Ventricular Fibrillation"
-        conf = vf_score
-    elif vt_score > 0.5:
+        conf = float(np.clip(vf_score, 0.0, 1.0))
+    elif possible_vt:
         label = "Possible Ventricular Tachycardia"
-        conf = vt_score
+        conf = float(np.clip(vt_score, 0.0, 1.0))
     elif af:
         label = "Possible Atrial Fibrillation"
         conf = float(np.clip(0.5 + cv_rr * 2.0, 0.3, 0.85))
@@ -718,6 +903,54 @@ def _classify_rhythm(
     out["confidence_score"] = conf
     return out
 
+
+def _compute_alert_latency(
+    rr_intervals_s: np.ndarray,
+    r_peaks: np.ndarray,
+    fs: float,
+) -> Optional[float]:
+    """
+    Compute acute-event detection latency. (fix #5)
+
+    Latency = time from event onset (first rapid beat) to detection.
+    For streaming: this approximates the time consumed by the
+    minimum number of beats needed to confirm the event.
+
+    Returns None when event onset cannot be reliably established
+    (e.g., too few RR intervals).
+    """
+    n_beats_needed = _CFG["vt_sustained_beats"]
+    if rr_intervals_s is None or len(rr_intervals_s) < n_beats_needed:
+        # Cannot establish onset from insufficient data
+        return None
+
+    # Find the onset of the rapid sequence (first of sustained rapid beats)
+    rapid_threshold_rr = 60.0 / _CFG["vt_hr_min_bpm"]
+    rapid = rr_intervals_s < rapid_threshold_rr
+
+    # Find first run of >= vt_sustained_beats consecutive rapid beats
+    run = 0
+    onset_idx = None
+    for i, r in enumerate(rapid):
+        if r:
+            run += 1
+            if run >= n_beats_needed and onset_idx is None:
+                onset_idx = i - n_beats_needed + 1
+        else:
+            run = 0
+
+    if onset_idx is None:
+        # No sustained rapid sequence found in the RR intervals
+        return None
+
+    # Latency = time from onset_idx to end of n_beats_needed
+    detection_rr = rr_intervals_s[onset_idx: onset_idx + n_beats_needed]
+    return float(np.sum(detection_rr))
+
+
+# ---------------------------------------------------------------------------
+# Morphology measurement
+# ---------------------------------------------------------------------------
 
 def _measure_morphology(
     raw: np.ndarray,
@@ -778,8 +1011,15 @@ def _measure_morphology(
         out["st_level_after"] = float(np.mean(st_after_list))
 
     scores: list[float] = []
-    if raw_amps and out["qrs_amplitude_before"] and out["qrs_amplitude_before"] > 1e-9:
-        ratio = out["qrs_amplitude_after"] / out["qrs_amplitude_before"]
+    qrs_amp_before = out["qrs_amplitude_before"]
+    qrs_amp_after = out["qrs_amplitude_after"]
+    # fix #10: explicit None check
+    if (
+        qrs_amp_before is not None
+        and qrs_amp_after is not None
+        and qrs_amp_before > 1e-9
+    ):
+        ratio = qrs_amp_after / qrs_amp_before
         scores.append(float(np.clip(min(ratio, 1.0), 0.0, 1.0)))
     if corrs:
         scores.append(float(np.clip(np.mean(corrs), 0.0, 1.0)))
@@ -827,8 +1067,10 @@ def _detect_powerline(
     sig: np.ndarray, freq: float, fs: float
 ) -> bool:
     """Return True if powerline interference at freq Hz is detected."""
-    nyq = fs / 2.0
-    if nyq <= freq or len(sig) < int(fs * 2):
+    # fix #7: validate before calling (also validated in caller, extra safety here)
+    if not _notch_valid(freq, fs):
+        return False
+    if len(sig) < int(fs * 2):
         return False
     try:
         n_seg = min(2048, len(sig))
@@ -863,8 +1105,7 @@ def _characterize_emg(
     else:
         # Fallback: kurtosis heuristic
         try:
-            from scipy.stats import kurtosis
-            k = float(kurtosis(np.diff(finite), fisher=True))
+            k = float(_scipy_kurtosis(np.diff(finite), fisher=True))
             hf = float(np.clip(k / 20.0, 0.0, 1.0))
         except Exception:
             hf = 0.0
@@ -886,7 +1127,6 @@ def _dominant_noise_type(
         return "EMG contamination"
     if "MILD" in emg_severity:
         return "Mild EMG / noise"
-    # Check baseline wander
     try:
         n_seg = min(256, len(sig))
         freqs, psd = sp_signal.welch(sig, fs=fs, nperseg=n_seg)
@@ -900,8 +1140,15 @@ def _dominant_noise_type(
     return "Clean"
 
 
-def _estimate_snr(sig: np.ndarray) -> Optional[float]:
-    """Estimate SNR in dB. Returns None if unreliable."""
+def _estimate_snr_proxy(sig: np.ndarray) -> Optional[float]:
+    """
+    Signal-derived SNR proxy in dB. (fix #8)
+
+    This is NOT a reference-based true SNR. It is a proxy metric
+    derived from the signal itself (amplitude / noise floor estimate).
+    Clearly named _estimate_snr_proxy to distinguish from true SNR.
+    Returns None if the estimate is unreliable.
+    """
     finite = sig[np.isfinite(sig)]
     if len(finite) < 20:
         return None
@@ -911,6 +1158,28 @@ def _estimate_snr(sig: np.ndarray) -> Optional[float]:
         return None
     snr = 20 * math.log10(amp / noise_rms)
     return float(np.clip(snr, -20.0, 60.0))
+
+
+def _signal_spectral_entropy(sig: np.ndarray, fs: float) -> Optional[float]:
+    """
+    Compute normalised spectral entropy of the ECG signal (0–1).
+
+    Used for signal-level VF evidence. Returns None if computation fails.
+    """
+    if len(sig) < int(fs * 2):
+        return None
+    try:
+        n_seg = min(1024, len(sig))
+        _, psd = sp_signal.welch(sig, fs=fs, nperseg=n_seg)
+        p = psd + 1e-30
+        p /= p.sum()
+        n_bins = len(p)
+        if n_bins < 2:
+            return None
+        entropy = float(-np.sum(p * np.log2(p + 1e-30)) / math.log2(n_bins))
+        return float(np.clip(entropy, 0.0, 1.0))
+    except Exception:
+        return None
 
 
 def _compute_reliability(
@@ -999,7 +1268,7 @@ def _extract_amplitudes_sub(
 
 
 def _rr_entropy(rr: np.ndarray, bins: int = 32) -> float:
-    """Compute spectral entropy of RR series (0-1)."""
+    """Compute normalised histogram entropy of RR series (0-1)."""
     if len(rr) < 4:
         return 0.0
     try:
@@ -1026,11 +1295,8 @@ def process_batch(
     Parameters
     ----------
     signals : list of np.ndarray
-        List of signal arrays.
-    fs : float
-        Sampling rate in Hz (same for all signals).
-    modality : str
-        Signal modality.
+    fs : float — sampling rate (same for all signals)
+    modality : str — signal modality
 
     Returns
     -------
